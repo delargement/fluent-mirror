@@ -1,7 +1,7 @@
 export type Language = 'German' | 'French' | 'Spanish' | 'English';
 export type Mode = 'Flow' | 'Coach' | 'Shadow';
 export type Correction = { corrected: string; explanation: string; category: string };
-export type Turn = Correction & { id: string; original: string; language: Language; demo: boolean; timestamp: number };
+export type Turn = Correction & { id: string; original: string; language: Language; demo: boolean; timestamp: number; pending?: boolean };
 export type SavedSession = { id: string; date: number; language: Language; mode: Mode; topic: string; seconds: number; turns: Turn[]; demo: boolean };
 export const languages: Language[] = ['German', 'French', 'Spanish', 'English'];
 export const languageCodes: Record<Language, string> = { German: 'de-DE', French: 'fr-FR', Spanish: 'es-ES', English: 'en-US' };
@@ -27,16 +27,39 @@ export const samples: Record<Language, { original: string; corrected: string; ex
 };
 export const greetings: Record<Language, string> = { German: 'Erzähl mir ein bisschen von dir. Was machst du gern, wenn du nicht studierst?', French: 'Parle-moi un peu de toi. Qu’est-ce que tu aimes faire pendant ton temps libre ?', Spanish: 'Cuéntame un poco sobre ti. ¿Qué te gusta hacer en tu tiempo libre?', English: 'Tell me a little about yourself. What do you like doing in your free time?' };
 export const modeDescriptions: Record<Mode, string> = { Flow: 'Keep talking. Corrections appear quietly when you pause.', Coach: 'Understand each correction with a short explanation.', Shadow: 'Listen to the improved sentence, then say it out loud.' };
+// Transcript punctuation and capitalization are not spoken-language mistakes.
+export function spokenWord(word: string) {
+ return word.normalize('NFC').replace(/[^\p{L}\p{N}]/gu, '').toLowerCase();
+}
+export function sameSpokenWords(original: string, corrected: string) {
+ return JSON.stringify(spokenWords(original)) === JSON.stringify(spokenWords(corrected));
+}
+const spokenWords = (text: string) => text.trim().split(/\s+/).map(spokenWord).filter(Boolean);
+export function normalizeCorrection(original: string, correction: Correction): Correction {
+ if (correction.category === 'Not reviewed' || correction.category === 'Checking') return correction;
+ const before = spokenWords(original), after = spokenWords(correction.corrected);
+ // Adding a guessed ending to an otherwise untouched phrase is completion,
+ // not correction. A smaller model must not invent what the learner meant.
+ if (/incomplete|unfinished|fragment/i.test(correction.category) || (before.length > 0 && after.length > before.length && before.every((word, i) => after[i] === word))) {
+  return { corrected: original, explanation: 'Continue speaking; this phrase has not been completed.', category: 'Incomplete phrase' };
+ }
+ return sameSpokenWords(original, correction.corrected)
+  ? { corrected: original, explanation: 'No spoken-language correction needed.', category: 'No correction' }
+  : correction;
+}
 export function wordDiff(original: string, corrected: string) {
- const a = original.split(/\s+/), b = corrected.split(/\s+/);
+ const a = original.trim().split(/\s+/).filter(Boolean), b = corrected.trim().split(/\s+/).filter(Boolean);
+ const ak = a.map(spokenWord), bk = b.map(spokenWord);
  const table = Array.from({length: a.length + 1}, () => new Array<number>(b.length + 1).fill(0));
- for(let i=a.length-1;i>=0;i--) for(let j=b.length-1;j>=0;j--) table[i][j] = a[i]===b[j] ? 1+table[i+1][j+1] : Math.max(table[i+1][j],table[i][j+1]);
+ for(let i=a.length-1;i>=0;i--) for(let j=b.length-1;j>=0;j--) table[i][j] = !ak[i] ? table[i+1][j] : !bk[j] ? table[i][j+1] : ak[i]===bk[j] ? 1+table[i+1][j+1] : Math.max(table[i+1][j],table[i][j+1]);
  const old: {text:string; changed:boolean}[] = [], next: {text:string; changed:boolean}[] = [];
  let i=0,j=0;
  while(i<a.length || j<b.length) {
-  if(i<a.length && j<b.length && a[i]===b[j]) { old.push({text:a[i++],changed:false}); next.push({text:b[j++],changed:false}); }
-  else if(j<b.length && (i===a.length || table[i][j+1]>=table[i+1][j])) next.push({text:b[j++],changed:true});
-  else old.push({text:a[i++],changed:true});
+  if(i<a.length&&!ak[i]){old.push({text:a[i++],changed:false});continue}
+  if(j<b.length&&!bk[j]){next.push({text:b[j++],changed:false});continue}
+  if(i<a.length && j<b.length && ak[i]===bk[j]) { old.push({text:a[i++],changed:false}); next.push({text:b[j++],changed:false}); }
+  else if(j<b.length && (i===a.length || table[i][j+1]>=table[i+1][j])) { next.push({text:b[j],changed:!!bk[j]});j++; }
+  else { old.push({text:a[i],changed:!!ak[i]});i++; }
  }
  return {old,next};
 }

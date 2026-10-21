@@ -2,7 +2,8 @@
 
 import { useEffect, useRef, useState } from 'react';
 import { ArrowDown, ArrowLeft, ArrowRight, AudioLines, Bookmark, BookOpen, Check, ChevronDown, ChevronLeft, ChevronRight, CircleHelp, Clock3, Download, Focus, Globe2, Headphones, History, Keyboard, Mic, MicOff, Play, Settings2, Sparkles, Square, Volume2, VolumeX, Waves, X } from 'lucide-react';
-import { Correction, Turn, SavedSession, Language, Mode, languages, languageCodes, samples, greetings, modeDescriptions, wordDiff, formatTime } from '@/lib/mirror';
+import { Correction, Turn, SavedSession, Language, Mode, languages, languageCodes, samples, greetings, modeDescriptions, wordDiff, formatTime, normalizeCorrection } from '@/lib/mirror';
+import { createCorrectionQueue } from '@/lib/correction-queue';
 
 function uid(){return typeof crypto.randomUUID==='function'?crypto.randomUUID():`fm-${Date.now().toString(36)}-${Math.random().toString(36).slice(2)}`}
 async function json<T>(r:Response):Promise<T>{return await r.json() as T}
@@ -16,6 +17,7 @@ const navItems = [{id:'practice' as View,label:'Live practice',Icon:AudioLines},
 function Logo(){return <span className="brandmark" aria-hidden="true"><i/><i/></span>}
 function Equalizer({active=false}:{active?:boolean}){return <span className={`equalizer ${active?'moving':''}`} aria-hidden="true">{Array.from({length:19},(_,i)=><i key={i} style={{height:`${[7,13,22,12,28,35,19,27,41,23,34,17,28,13,23,10,17,9,5][i]}px`,animationDelay:`${i*.075}s`}}/>)}</span>}
 function readLocal<T,>(key:string,fallback:T):T{try { const value=localStorage.getItem(key); return value ? JSON.parse(value):fallback; }catch{return fallback}}
+function normalizeTurn(turn:Turn):Turn{return {...turn,...normalizeCorrection(turn.original,turn)}}
 
 export default function FluentMirror({demoOnly=false}:{demoOnly?:boolean}){
  const [view,setView] = useState<View>('practice');
@@ -32,7 +34,7 @@ export default function FluentMirror({demoOnly=false}:{demoOnly?:boolean}){
  const peer=useRef<RTCPeerConnection|null>(null),channel=useRef<RTCDataChannel|null>(null),stream=useRef<MediaStream|null>(null),audio=useRef<HTMLAudioElement|null>(null);
  const liveStarted=useRef(false);
  const pending=useRef(''),lastEnd=useRef(0),outputEnd=useRef(0),outputText=useRef(''),lastCorrection=useRef('');
- const correctionQueue=useRef<Promise<void>>(Promise.resolve());
+ const [correctionQueue]=useState(()=>createCorrectionQueue(2));
  const pauseTimer=useRef<ReturnType<typeof setTimeout>|null>(null),demoTimer=useRef<ReturnType<typeof setInterval>|null>(null),closeTimer=useRef<ReturnType<typeof setTimeout>|null>(null);
  const generation=useRef(0),turnsRef=useRef<Turn[]>([]),settingsRef=useRef(settings),modeRef=useRef(mode);
  const active=status==='live'||status==='demo';
@@ -47,7 +49,12 @@ export default function FluentMirror({demoOnly=false}:{demoOnly?:boolean}){
  function notify(text:string){setToast(text)}
  function persist(key:string,value:unknown){try{localStorage.setItem(key,JSON.stringify(value))}catch{notify('Your browser could not save this. Export your session to keep a copy.')}}
  function stopAudio(){window.speechSynthesis?.cancel()}
- function cleanup(){liveStarted.current=false;
+ function cleanup(){liveStarted.current=false;correctionQueue.cancel();
+  if(turnsRef.current.some(t=>t.pending)){
+   const next=turnsRef.current.map(t=>t.pending?{...t,pending:false,corrected:t.original,explanation:'The voice session ended before this correction arrived.',category:'Not reviewed'}:t);
+   turnsRef.current=next;setTurns(next);
+  }
+  setBusy(false);
   if(pauseTimer.current)clearTimeout(pauseTimer.current);
   if(demoTimer.current)clearInterval(demoTimer.current);
   if(closeTimer.current)clearTimeout(closeTimer.current);
@@ -59,7 +66,7 @@ export default function FluentMirror({demoOnly=false}:{demoOnly?:boolean}){
  }
  useEffect(()=>{
   setSettings({...defaults,...readLocal<Settings>('fm-settings',defaults)});
-  setHistory(readLocal<SavedSession[]>('fm-history',[]));setSaved(readLocal<Turn[]>('fm-saved',[]));
+  setHistory(readLocal<SavedSession[]>('fm-history',[]).map(s=>({...s,turns:s.turns.map(normalizeTurn)})));setSaved(readLocal<Turn[]>('fm-saved',[]).map(normalizeTurn));
   if(!demoOnly)fetch('/api/status').then(r=>json<{ready:boolean}>(r)).then(d=>setReady(!!d.ready)).catch(()=>setReady(false));
   return ()=>{generation.current++;cleanup()};
  // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -87,29 +94,46 @@ export default function FluentMirror({demoOnly=false}:{demoOnly?:boolean}){
   window.speechSynthesis.speak(utterance);
  }
  function voiceInstructions(){const s=settingsRef.current;const m=modeRef.current;return `You are a warm, curious language conversation partner in Fluent Mirror. Speak ${s.language} at ${s.level} level. Topic: ${s.topic}. Ask one short question at a time and leave room for the user. Do not read grammar corrections aloud; a separate panel handles corrections. ${m==='Coach'?'Offer a brief explanation only if asked.':m==='Shadow'?'Help the user practise repeating improved sentences. When they repeat a sentence, acknowledge briefly and wait.':'Keep the conversation natural and flowing.'}`}
- function addTurn(original:string,result:Correction,demo:boolean){
-  const t:Turn={...result,id:uid(),original,language:settingsRef.current.language,demo,timestamp:Date.now()};
-  setTurns(previous=>{const next=[...previous,t];turnsRef.current=next;setSelected(next.length-1);return next});setDraft(pending.current);
-  if(modeRef.current==='Shadow'){setMuted(true);stream.current?.getAudioTracks().forEach(t=>t.enabled=false);if(audio.current)audio.current.muted=true;speak(t.corrected,t.language)}
+ function addTurn(original:string,result:Correction,demo:boolean,isPending=false){
+  const t:Turn={...result,id:uid(),original,language:settingsRef.current.language,demo,timestamp:Date.now(),pending:isPending};
+  const next=[...turnsRef.current,t];turnsRef.current=next;setTurns(next);setSelected(next.length-1);setDraft(pending.current);
+  if(!isPending&&modeRef.current==='Shadow'){setMuted(true);stream.current?.getAudioTracks().forEach(t=>t.enabled=false);if(audio.current)audio.current.muted=true;speak(t.corrected,t.language)}
+  return t;
  }
  async function correct(text:string){
   if(demoOnly){notify('This public demo uses prepared sample sentences.');return}
   if(!text.trim()||text===lastCorrection.current)return;
   lastCorrection.current=text;const ticket=generation.current;setBusy(true);
-  try{
-   const response=await fetch('/api/correct',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({text,language:settingsRef.current.language,style:settingsRef.current.style,context:turnsRef.current.slice(-3).map(t=>t.original)})});
-   const data=await json<Correction & {error?:string}>(response);if(!response.ok)throw new Error(data.error||'Correction could not be loaded.');
-   if(ticket!==generation.current)return;addTurn(text,data,false);
-  }catch(e){if(ticket===generation.current){notify(e instanceof Error?e.message:'Correction failed.');setDraft(text)}}finally{if(ticket===generation.current)setBusy(false)}
+  const context=turnsRef.current.slice(-3).map(t=>t.original);const settingsAtStart={...settingsRef.current};
+  const turn=addTurn(text,{corrected:text,explanation:'Checking your words…',category:'Checking'},false,true);
+  const queuedAt=performance.now();
+  function finish(result:Correction){
+   if(ticket!==generation.current)return;
+   const next=turnsRef.current.map(t=>t.id===turn.id?{...t,...result,pending:false}:t);
+   turnsRef.current=next;setTurns(next);setBusy(next.some(t=>t.pending));
+  }
+  correctionQueue.enqueue(async signal=>{
+   if(ticket!==generation.current)return;
+   const requestAt=performance.now();
+   try{
+    const response=await fetch('/api/correct',{method:'POST',signal,headers:{'Content-Type':'application/json'},body:JSON.stringify({text,language:settingsAtStart.language,style:settingsAtStart.style,context})});
+    const data=await json<Correction & {error?:string;timing?:{model:string;durationMs:number}}>(response);if(!response.ok)throw new Error(data.error||'Correction could not be loaded.');
+    if(ticket!==generation.current||signal.aborted)return;
+    finish(normalizeCorrection(text,data));
+    console.info('[Fluent Mirror] correction timing',{queueMs:Math.round(requestAt-queuedAt),requestMs:Math.round(performance.now()-requestAt),...data.timing});
+    // An older response must not interrupt a newer sentence or its audio.
+    if(modeRef.current==='Shadow'&&turnsRef.current.at(-1)?.id===turn.id&&!pending.current){setMuted(true);stream.current?.getAudioTracks().forEach(t=>t.enabled=false);if(audio.current)audio.current.muted=true;speak(data.corrected,turn.language)}
+   }catch(e){if(ticket===generation.current&&!signal.aborted){finish({corrected:text,explanation:'This sentence could not be reviewed. Try again later.',category:'Not reviewed'});lastCorrection.current='';notify(e instanceof Error?e.message:'Correction failed.')}}
+  });
  }
- function flush(){const text=pending.current.trim();if(!text)return;pending.current='';const ticket=generation.current;correctionQueue.current=correctionQueue.current.then(async()=>{if(ticket===generation.current)await correct(text)}).catch(()=>notify('A correction could not be processed.'));}
+ function flush(){const text=pending.current.trim();if(!text)return;pending.current='';void correct(text);}
  function onEvent(event:{type:string;delta?:string;start_ms?:number;end_ms?:number;error?:{message?:string}}){
   if(event.type==='session.started'){liveStarted.current=true;if(closeTimer.current)clearTimeout(closeTimer.current);setStatus('live');setReply('I’m here. Start speaking whenever you’re ready.');channel.current?.send(JSON.stringify({type:'session.commentary.append',event_id:uid(),delegation_id:null,content:`Greet the user now in ${settingsRef.current.language} and ask one short question about ${settingsRef.current.topic}, then listen.`}));}
   if(event.type==='session.input_transcript.delta'){
    if(pauseTimer.current)clearTimeout(pauseTimer.current);
-   if(typeof event.start_ms==='number'&&event.start_ms-lastEnd.current>1600&&pending.current.trim())flush();
+   if(typeof event.start_ms==='number'&&event.start_ms-lastEnd.current>1100&&pending.current.trim())flush();
    pending.current+=event.delta||'';lastEnd.current=event.end_ms||lastEnd.current;setDraft(pending.current);setSelected(turnsRef.current.length-1);
-   pauseTimer.current=setTimeout(flush,1800);
+   pauseTimer.current=setTimeout(flush,pending.current.trim().split(/\s+/).length<=3?1300:900);
   }
   if(event.type==='session.output_transcript.delta'){
    if(typeof event.start_ms==='number'&&event.start_ms-outputEnd.current>1800)outputText.current='';
@@ -118,7 +142,7 @@ export default function FluentMirror({demoOnly=false}:{demoOnly?:boolean}){
   if(event.type==='session.closed'){cleanup();setStatus('idle')}
   if(event.type==='error')notify(event.error?.message||'The voice connection reported an error.');
  }
- function resetSession(){generation.current++;correctionQueue.current=Promise.resolve();turnsRef.current=[];setTurns([]);setSelected(-1);setDraft('');setReply('');setSeconds(0);setDemoStep(0);setBusy(false);pending.current='';outputText.current='';lastEnd.current=0;outputEnd.current=0;lastCorrection.current='';setView('practice');setReview(null)}
+ function resetSession(){generation.current++;correctionQueue.cancel();turnsRef.current=[];setTurns([]);setSelected(-1);setDraft('');setReply('');setSeconds(0);setDemoStep(0);setBusy(false);pending.current='';outputText.current='';lastEnd.current=0;outputEnd.current=0;lastCorrection.current='';setView('practice');setReview(null)}
  async function startLive(){
   if(demoOnly){playDemo();return}
   setModal(null);resetSession();setStatus('connecting');const ticket=generation.current;
@@ -155,7 +179,9 @@ export default function FluentMirror({demoOnly=false}:{demoOnly?:boolean}){
  function endSession(){
   if(status==='connecting'){generation.current++;cleanup();setStatus('idle');return}
   if(pending.current.trim()){const text=pending.current.trim();pending.current='';setDraft('');addTurn(text,{corrected:text,explanation:'This final fragment was saved without a correction because the session ended.',category:'Not reviewed'},false)}
-  if(demoTimer.current)clearInterval(demoTimer.current);generation.current++;setBusy(false);stopAudio();
+  if(demoTimer.current)clearInterval(demoTimer.current);generation.current++;correctionQueue.cancel();setBusy(false);stopAudio();
+  const finishedTurns=turnsRef.current.map(t=>t.pending?{...t,pending:false,corrected:t.original,explanation:'The session ended before this correction arrived.',category:'Not reviewed'}:t);
+  turnsRef.current=finishedTurns;setTurns(finishedTurns);
   if(channel.current?.readyState==='open'){
    setStatus('ending');stream.current?.getAudioTracks().forEach(t=>t.enabled=false);channel.current.send(JSON.stringify({type:'session.close'}));closeTimer.current=setTimeout(()=>{cleanup();setStatus('idle');notify('Session ended. Final voice usage could not be confirmed.')},15000);
   }else{cleanup();setStatus('idle')}
@@ -188,7 +214,7 @@ export default function FluentMirror({demoOnly=false}:{demoOnly?:boolean}){
      <div className="mode-hint">{modeDescriptions[mode]}</div>
      <article className={`speech-card original-card ${draft?'transcribing':''}`}><div className="card-label"><span><Mic size={15}/>YOU SAID</span><span className="card-state">{isSample?'EXAMPLE':draft?'TRANSCRIBING':current?.demo?'DEMO TRANSCRIPT':'YOUR WORDS'}</span></div><div className="sentence" lang={languageCodes[settings.language]}>{draft?draft:<>{diff.old.map((w,i)=><span key={i} className={showChanges&&w.changed?'removed':''}>{w.text}{' '}</span>)}</>}{draft&&<i className="caret"/>}</div><div className="card-footer"><span className="quiet-label">{draft?'Your words, as they arrive.':'Every thought starts somewhere.'}</span><span className="speech-dots" aria-hidden="true">•••</span></div></article>
      <div className="mirror-bridge"><span/><div><ArrowDown size={14}/></div><span/></div>
-     <article className={`speech-card corrected-card ${busy?'processing':''}`} aria-busy={busy}><div className="card-label"><span><Sparkles size={15}/>SAY IT BETTER</span><span className="natural-pill"><span/>{current?.demo||isSample?'Sample correction':settings.style==='Sound natural'?'A little more natural':'Grammar polished'}</span></div><div className="sentence corrected-sentence" lang={languageCodes[settings.language]} aria-live="polite">{draft&&busy?<span className="waiting-text">A clearer reflection is on its way<span className="loading-dots">…</span></span>:diff.next.map((w,i)=><span key={i} className={showChanges&&w.changed?'improved':''}>{w.text}{' '}</span>)}</div><div className="correction-actions"><button className="text-btn why-btn" aria-expanded={showWhy} onClick={()=>setShowWhy(!showWhy)}><BookOpen size={14}/>{showWhy?'Hide explanation':'Why this works'}<ChevronDown size={12} className={showWhy?'rotate':''}/></button><div className="small-actions"><button className="icon-btn" aria-label="Listen to corrected sentence" title="Listen to pronunciation" onClick={()=>speak(corrected)}><Volume2 size={17}/></button><button className={`icon-btn ${isSaved?'is-saved':''}`} aria-label={isSaved?'Unsave phrase':'Save phrase'} title="Save phrase" disabled={!current||!!draft} onClick={()=>current&&savePhrase(current)}>{isSaved?<Check size={17}/>:<Bookmark size={17}/>}</button></div></div>{showWhy&&<div className="explanation"><span>{current?.category||example.category}</span><p>{current?.explanation||example.explanation}</p></div>}{mode==='Shadow'&&current&&<button className="shadow-prompt" onClick={resumeShadow}><Mic size={15}/>{muted?'Your turn — repeat it aloud':'Repeat the sentence at your own pace'}<ArrowRight size={15}/></button>}</article>
+     <article className={`speech-card corrected-card ${busy||current?.pending?'processing':''}`} aria-busy={busy||!!current?.pending}><div className="card-label"><span><Sparkles size={15}/>SAY IT BETTER</span><span className="natural-pill"><span/>{current?.demo||isSample?'Sample correction':settings.style==='Sound natural'?'A little more natural':'Grammar polished'}</span></div><div className="sentence corrected-sentence" lang={languageCodes[settings.language]} aria-live="polite">{(draft&&busy)||current?.pending?<span className="waiting-text">A clearer reflection is on its way<span className="loading-dots">…</span></span>:diff.next.map((w,i)=><span key={i} className={showChanges&&w.changed?'improved':''}>{w.text}{' '}</span>)}</div><div className="correction-actions"><button className="text-btn why-btn" aria-expanded={showWhy} onClick={()=>setShowWhy(!showWhy)}><BookOpen size={14}/>{showWhy?'Hide explanation':'Why this works'}<ChevronDown size={12} className={showWhy?'rotate':''}/></button><div className="small-actions"><button className="icon-btn" aria-label="Listen to corrected sentence" title="Listen to pronunciation" disabled={!!current?.pending||!!draft} onClick={()=>speak(corrected)}><Volume2 size={17}/></button><button className={`icon-btn ${isSaved?'is-saved':''}`} aria-label={isSaved?'Unsave phrase':'Save phrase'} title="Save phrase" disabled={!current||!!draft||!!current.pending} onClick={()=>current&&savePhrase(current)}>{isSaved?<Check size={17}/>:<Bookmark size={17}/>}</button></div></div>{showWhy&&<div className="explanation"><span>{current?.category||example.category}</span><p>{current?.explanation||example.explanation}</p></div>}{mode==='Shadow'&&current&&<button className="shadow-prompt" onClick={resumeShadow}><Mic size={15}/>{muted?'Your turn — repeat it aloud':'Repeat the sentence at your own pace'}<ArrowRight size={15}/></button>}</article>
      <div className="mirror-under"><span><span className="legend-dot"/>Same meaning. A smoother way to say it.</span>{turns.length>0&&<div className="turn-nav"><button className="icon-btn" aria-label="Previous sentence" disabled={selected<=0||!!draft} onClick={()=>setSelected(s=>s-1)}><ChevronLeft size={16}/></button><span>{selected+1} / {turns.length}</span><button className="icon-btn" aria-label="Next sentence" disabled={selected>=turns.length-1||!!draft} onClick={()=>setSelected(s=>s+1)}><ChevronRight size={16}/></button></div>}</div>
      {typed&&!demoOnly&&<form className="typed-form" onSubmit={e=>{e.preventDefault();void submitTyped()}}><input aria-label="Sentence to correct" placeholder={`Type a sentence in ${settings.language}…`} maxLength={2000} value={input} onChange={e=>setInput(e.target.value)} autoFocus/><button className="icon-btn" type="submit" disabled={busy||!input.trim()} aria-label="Correct sentence"><ArrowRight size={18}/></button></form>}
      <div className="session-dock"><div className="dock-status"><div className={`mic-indicator ${active&&!muted?'active':''}`}><Mic size={17}/></div><div><strong>{status==='connecting'?'Finding your connection…':status==='ending'?'Finishing your session…':status==='demo'?(muted?'Demo paused':'A glimpse of the flow'):status==='live'?(muted?'Microphone muted':'The floor is yours'):'A conversation starts with you.'}</strong><small>{status==='demo'?'Sample speech · your microphone is off':status==='live'?'Your partner is listening. Take your time.':demoOnly?'Explore sample sentences at your own pace.':'Put on your headphones. Take a breath.'}</small></div></div><div className="dock-buttons">{active?<><button className={`icon-btn mute-btn ${muted?'muted':''}`} onClick={toggleMute} aria-label={muted?'Unmute microphone':'Mute microphone'} title="Alt + Space">{muted?<MicOff size={19}/>:<Mic size={19}/>}</button><button className="end-btn" onClick={endSession}><Square size={13} fill="currentColor"/>End session</button></>:status==='connecting'?<button className="outline-btn" onClick={endSession}>Cancel</button>:<button className="primary-btn" disabled={status==='ending'} onClick={()=>demoOnly?playDemo():ready?void startLive():setModal('connect')}>{demoOnly?<Play size={17}/>:<Mic size={17}/>} {demoOnly?'Try a demo':'Start speaking'}<ArrowRight size={16}/></button>}</div></div>

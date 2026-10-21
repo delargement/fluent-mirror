@@ -14,7 +14,8 @@
     "db:generate": "drizzle-kit generate",
     "dev:demo": "vite --config vite.demo.config.ts",
     "build:demo": "vite build --config vite.demo.config.ts",
-    "preview:demo": "vite preview --config vite.demo.config.ts"
+    "preview:demo": "vite preview --config vite.demo.config.ts",
+    "test:corrections": "node --experimental-strip-types --test scripts/corrections.test.mjs"
   },
   "dependencies": {
     "@base-ui/react": "^1.7.0",

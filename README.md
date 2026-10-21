@@ -73,9 +73,11 @@ Create `.dev.vars` beside `package.json`:
 OPENAI_API_KEY=your_key_here
 ```
 
-Run `pnpm dev` and open **http://localhost:5173**. Allow microphone access for live voice. Restart the server after changing environment variables.
+Run `pnpm dev` and open **http://localhost:5173**. The home page starts the sign-in flow automatically. On localhost, the development plugin creates a local test session; the hosted app uses ChatGPT sign-in. Allow microphone access for live voice. Restart the server after changing environment variables.
 
-Optional server variables: `OPENAI_VOICE_MODEL` and `OPENAI_TEXT_MODEL`. The current defaults are `gpt-live-1` and `gpt-5.6-luna`. OpenAI API usage is billed separately from ChatGPT subscriptions. End live sessions when finished.
+Optional server variables: `OPENAI_VOICE_MODEL` and `OPENAI_TEXT_MODEL`. The current defaults are `gpt-live-1` and `gpt-4.1-nano`. OpenAI API usage is billed separately from ChatGPT subscriptions. End live sessions when finished.
+
+Corrections focus on speech: punctuation and capitalization are ignored, and unfinished phrases are kept intact. Punctuation-only edits are suppressed even if a model returns them. Corrections start after roughly 0.9 seconds without a transcript delta (1.3 seconds for very short fragments), with up to two requests in flight. Each result updates its original sentence, so a slow response does not reorder the transcript. Ending a session cancels pending requests. The console records model and request/queue timing without logging speech or API keys. Run `pnpm test:corrections` for focused regression checks.
 
 Keep `.dev.vars` local; `.dev.vars*` and `.env*` are ignored by Git. Hosted live practice needs the key configured as a server-side secret. Never put an API key in frontend code, a public repository, or GitHub Pages.
 
